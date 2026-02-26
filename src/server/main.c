@@ -2,7 +2,21 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <signal.h>
+#include <time.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <poll.h>
 #include "protocol.h"
+
+#define MAX_CLIENTS 32
+#define INTERVAL_MS 1000   /* push metrics every 1 second */
+
+/* ── graceful shutdown flag ───────────────────────────────────────────────── */
+static volatile int running = 1;
+static void handle_signal(int sig) { (void)sig; running = 0; }
 
 /* ── /proc/uptime ─────────────────────────────────────────────────────────── */
 long read_uptime(void) {
@@ -55,17 +69,16 @@ static int read_cpu_ticks(CpuTicks *cores, int max_cores, int *count) {
     *count = 0;
 
     while (fgets(line, sizeof(line), fp)) {
-        /* skip the aggregate "cpu " line, read per-core "cpu0", "cpu1", … */
         if (strncmp(line, "cpu", 3) != 0) break;
-        if (line[3] == ' ') continue;   /* aggregate line */
+        if (line[3] == ' ') continue;
 
-            if (*count >= max_cores) break;
-            sscanf(line + 3, "%*d %lld %lld %lld %lld %lld %lld %lld",
-                   &cores[*count].user,  &cores[*count].nice,
-                   &cores[*count].system,&cores[*count].idle,
-                   &cores[*count].iowait,&cores[*count].irq,
-                   &cores[*count].softirq);
-            (*count)++;
+        if (*count >= max_cores) break;
+        sscanf(line + 3, "%*d %lld %lld %lld %lld %lld %lld %lld",
+               &cores[*count].user,  &cores[*count].nice,
+               &cores[*count].system,&cores[*count].idle,
+               &cores[*count].iowait,&cores[*count].irq,
+               &cores[*count].softirq);
+        (*count)++;
     }
     fclose(fp);
     return 0;
@@ -97,7 +110,6 @@ void compute_cpu(SystemMetrics *m,
 
                  /* ── JSON serializer ──────────────────────────────────────────────────────── */
                  void serialize_metrics(const SystemMetrics *m, char *buf, size_t buf_size) {
-                     /* build cpu_cores array string first */
                      char cores_str[512] = "[";
                      for (int i = 0; i < m->core_count; i++) {
                          char tmp[32];
@@ -119,54 +131,151 @@ void compute_cpu(SystemMetrics *m,
                               "\"load_15m\":%.2f,"
                               "\"uptime_sec\":%ld"
                               "}\n",
-                              m->cpu_pct,
-                              cores_str,
-                              m->mem_total_kb,
-                              m->mem_avail_kb,
-                              m->mem_pct,
-                              m->load_1m,
-                              m->load_5m,
-                              m->load_15m,
+                              m->cpu_pct, cores_str,
+                              m->mem_total_kb, m->mem_avail_kb, m->mem_pct,
+                              m->load_1m, m->load_5m, m->load_15m,
                               m->uptime_sec
                      );
                  }
 
-                 /* ── main ─────────────────────────────────────────────────────────────────── */
-                 int main(void) {
-                     printf("NixMon Server — /proc parser test\n");
-                     printf("──────────────────────────────────\n");
+                 /* ── TCP server setup ─────────────────────────────────────────────────────── */
+                 static int create_server_socket(int port) {
+                     int fd = socket(AF_INET, SOCK_STREAM, 0);
+                     if (fd < 0) { perror("socket"); return -1; }
 
-                     /* Two snapshots 1 second apart for CPU delta */
-                     CpuTicks t0[16], t1[16];
-                     int core_count = 0;
+                     /* allow immediate reuse after restart */
+                     int opt = 1;
+                     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-                     read_cpu_ticks(t0, 16, &core_count);
-                     sleep(1);
-                     read_cpu_ticks(t1, 16, &core_count);
+                     struct sockaddr_in addr = {
+                         .sin_family      = AF_INET,
+                         .sin_addr.s_addr = INADDR_ANY,
+                         .sin_port        = htons(port)
+                     };
 
-                     SystemMetrics m = {0};
-                     compute_cpu(&m, t0, t1, core_count);
-                     read_meminfo(&m);
-                     read_loadavg(&m);
-                     m.uptime_sec = read_uptime();
-
-                     /* ── print results ── */
-                     printf("Cores detected : %d\n",   m.core_count);
-                     printf("CPU (avg)      : %.1f%%\n", m.cpu_pct);
-                     for (int i = 0; i < m.core_count; i++)
-                         printf("  core%-2d       : %.1f%%\n", i, m.cpu_cores[i]);
-
-                     printf("RAM total      : %ld kB\n",  m.mem_total_kb);
-                     printf("RAM available  : %ld kB\n",  m.mem_avail_kb);
-                     printf("RAM used       : %.1f%%\n",  m.mem_pct);
-                     printf("Load avg       : %.2f  %.2f  %.2f  (1m 5m 15m)\n",
-                            m.load_1m, m.load_5m, m.load_15m);
-                     printf("Uptime         : %ld sec\n", m.uptime_sec);
-
-                     /* ── serialize to JSON ── */
-                     char json_buf[BUFFER_SIZE];
-                     serialize_metrics(&m, json_buf, sizeof(json_buf));
-                     printf("\nJSON frame:\n%s", json_buf);
-
-                     return 0;
+                     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+                         perror("bind"); close(fd); return -1;
+                     }
+                     if (listen(fd, 8) < 0) {
+                         perror("listen"); close(fd); return -1;
+                     }
+                     return fd;
                  }
+
+                 /* ── broadcast JSON to all connected clients ──────────────────────────────── */
+                 static void broadcast(struct pollfd *fds, int nfds, int server_fd,
+                                       const char *buf, int len) {
+                     for (int i = 0; i < nfds; i++) {
+                         if (fds[i].fd == server_fd || fds[i].fd < 0) continue;
+                         if (send(fds[i].fd, buf, len, MSG_NOSIGNAL) < 0) {
+                             /* client gone — mark for removal */
+                             close(fds[i].fd);
+                             fds[i].fd = -1;
+                         }
+                     }
+                                       }
+
+                                       /* ── main ─────────────────────────────────────────────────────────────────── */
+                                       int main(void) {
+                                           signal(SIGINT,  handle_signal);
+                                           signal(SIGTERM, handle_signal);
+
+                                           int server_fd = create_server_socket(PORT);
+                                           if (server_fd < 0) return 1;
+
+                                           printf("NixMon server listening on port %d  (Ctrl-C to stop)\n", PORT);
+
+                                           /* pollfd table: slot 0 = server listen socket */
+                                           struct pollfd fds[MAX_CLIENTS + 1];
+                                           memset(fds, 0, sizeof(fds));
+                                           fds[0].fd     = server_fd;
+                                           fds[0].events = POLLIN;
+                                           int nfds = 1;
+
+                                           /* CPU tick snapshots */
+                                           CpuTicks t0[16], t1[16];
+                                           int core_count = 0;
+                                           read_cpu_ticks(t0, 16, &core_count);
+
+                                           /* timing */
+                                           struct timespec last, now;
+                                           clock_gettime(CLOCK_MONOTONIC, &last);
+
+                                           while (running) {
+                                               /* wait up to INTERVAL_MS for any event */
+                                               int ready = poll(fds, nfds, INTERVAL_MS);
+
+                                               /* ── accept new clients ── */
+                                               if (ready > 0 && (fds[0].revents & POLLIN)) {
+                                                   struct sockaddr_in caddr;
+                                                   socklen_t clen = sizeof(caddr);
+                                                   int cfd = accept(server_fd, (struct sockaddr *)&caddr, &clen);
+                                                   if (cfd >= 0) {
+                                                       /* find a free slot */
+                                                       int added = 0;
+                                                       for (int i = 1; i <= MAX_CLIENTS; i++) {
+                                                           if (fds[i].fd <= 0) {
+                                                               fds[i].fd     = cfd;
+                                                               fds[i].events = POLLIN;
+                                                               if (i >= nfds) nfds = i + 1;
+                                                               added = 1;
+                                                               printf("Client connected  : %s:%d (fd=%d)\n",
+                                                                      inet_ntoa(caddr.sin_addr),
+                                                                      ntohs(caddr.sin_port), cfd);
+                                                               break;
+                                                           }
+                                                       }
+                                                       if (!added) {
+                                                           fprintf(stderr, "Max clients reached, dropping connection\n");
+                                                           close(cfd);
+                                                       }
+                                                   }
+                                               }
+
+                                               /* ── handle client disconnects (POLLHUP / POLLERR) ── */
+                                               for (int i = 1; i < nfds; i++) {
+                                                   if (fds[i].fd > 0 && (fds[i].revents & (POLLHUP | POLLERR))) {
+                                                       printf("Client disconnected (fd=%d)\n", fds[i].fd);
+                                                       close(fds[i].fd);
+                                                       fds[i].fd = -1;
+                                                   }
+                                               }
+
+                                               /* ── check if it's time to push metrics ── */
+                                               clock_gettime(CLOCK_MONOTONIC, &now);
+                                               long elapsed_ms = (now.tv_sec  - last.tv_sec)  * 1000 +
+                                               (now.tv_nsec - last.tv_nsec) / 1000000;
+
+                                               if (elapsed_ms >= INTERVAL_MS) {
+                                                   last = now;
+
+                                                   /* collect fresh snapshot */
+                                                   read_cpu_ticks(t1, 16, &core_count);
+
+                                                   SystemMetrics m = {0};
+                                                   compute_cpu(&m, t0, t1, core_count);
+                                                   read_meminfo(&m);
+                                                   read_loadavg(&m);
+                                                   m.uptime_sec = read_uptime();
+
+                                                   /* rotate snapshots */
+                                                   memcpy(t0, t1, sizeof(CpuTicks) * core_count);
+
+                                                   /* serialize and broadcast */
+                                                   char json_buf[BUFFER_SIZE];
+                                                   serialize_metrics(&m, json_buf, sizeof(json_buf));
+
+                                                   printf("Pushing: cpu=%.1f%% mem=%.1f%% load=%.2f\n",
+                                                          m.cpu_pct, m.mem_pct, m.load_1m);
+
+                                                   broadcast(fds, nfds, server_fd, json_buf, strlen(json_buf));
+                                               }
+                                           }
+
+                                           /* ── cleanup ── */
+                                           printf("\nShutting down...\n");
+                                           for (int i = 0; i < nfds; i++)
+                                               if (fds[i].fd > 0) close(fds[i].fd);
+
+                                               return 0;
+                                       }
