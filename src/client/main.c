@@ -196,7 +196,7 @@ static void draw_bar(WINDOW *win, int row, int col,
 
                          /* ── footer ── */
                          wattron(win, A_DIM);
-                         mvwprintw(win, row, 2, "  q - quit   |   connected to %s:%d", SERVER_IP, PORT);
+                         mvwprintw(win, row, 2, "q - quit  |  connected to %s:%d", SERVER_IP, PORT);
                          wattroff(win, A_DIM);
 
                          wrefresh(win);
