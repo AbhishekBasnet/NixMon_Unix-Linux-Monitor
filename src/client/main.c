@@ -103,13 +103,13 @@ static void draw_bar(WINDOW *win, int row, int col,
     /* filled portion */
     wattron(win, COLOR_PAIR(pct_color(pct)) | A_BOLD);
     for (int i = 0; i < filled; i++)
-        mvwaddch(win, row, col + i, ACS_CKBOARD);
+        mvwaddch(win, row, col + i, '#');
     wattroff(win, COLOR_PAIR(pct_color(pct)) | A_BOLD);
 
     /* empty portion */
     wattron(win, COLOR_PAIR(COLOR_BORDER));
     for (int i = filled; i < bar_w; i++)
-        mvwaddch(win, row, col + i, ACS_BULLET);
+        mvwaddch(win, row, col + i, '.');
     col += bar_w;
 
     /* closing bracket + percentage */
@@ -144,7 +144,7 @@ static void draw_bar(WINDOW *win, int row, int col,
                          /* ── title bar ── */
                          wattron(win, COLOR_PAIR(COLOR_TITLE) | A_BOLD);
                          mvwprintw(win, 0, (cols - 34) / 2,
-                                   "  NixMon — Real-Time System Monitor  ");
+                                   "  NixMon - Real-Time System Monitor  ");
                          wattroff(win, COLOR_PAIR(COLOR_TITLE) | A_BOLD);
 
                          int row = 2;
@@ -196,7 +196,37 @@ static void draw_bar(WINDOW *win, int row, int col,
 
                          /* ── footer ── */
                          wattron(win, A_DIM);
-                         mvwprintw(win, row, 2, "  q — quit   |   connected to %s:%d", SERVER_IP, PORT);
+                         mvwprintw(win, row, 2, "  q - quit   |   connected to %s:%d", SERVER_IP, PORT);
+                         wattroff(win, A_DIM);
+
+                         wrefresh(win);
+                     }
+
+                     /* ── reconnecting screen ──────────────────────────────────────────────────── */
+                     static void render_reconnecting(WINDOW *win, int attempt) {
+                         int rows, cols;
+                         getmaxyx(win, rows, cols);
+
+                         wclear(win);
+                         box(win, 0, 0);
+
+                         wattron(win, COLOR_PAIR(COLOR_TITLE) | A_BOLD);
+                         mvwprintw(win, 0, (cols - 34) / 2,
+                                   "  NixMon - Real-Time System Monitor  ");
+                         wattroff(win, COLOR_PAIR(COLOR_TITLE) | A_BOLD);
+
+                         wattron(win, COLOR_PAIR(COLOR_HIGH) | A_BOLD);
+                         mvwprintw(win, rows / 2 - 1, (cols - 24) / 2, "  Server disconnected!  ");
+                         wattroff(win, COLOR_PAIR(COLOR_HIGH) | A_BOLD);
+
+                         wattron(win, COLOR_PAIR(COLOR_MED));
+                         mvwprintw(win, rows / 2 + 1, (cols - 36) / 2,
+                                   "  Reconnecting to %s:%d  (attempt %d)  ",
+                                   SERVER_IP, PORT, attempt);
+                         wattroff(win, COLOR_PAIR(COLOR_MED));
+
+                         wattron(win, A_DIM);
+                         mvwprintw(win, rows / 2 + 3, (cols - 16) / 2, "  q — quit  ");
                          wattroff(win, A_DIM);
 
                          wrefresh(win);
@@ -240,6 +270,8 @@ static void draw_bar(WINDOW *win, int row, int col,
                          char buf[BUFFER_SIZE];
                          int  buf_len = 0;
                          SystemMetrics m = {0};
+                         int quit = 0;
+                         int attempt = 1;
 
                          /* show a "waiting" message until first frame arrives */
                          wattron(win, COLOR_PAIR(COLOR_TITLE) | A_BOLD);
@@ -247,7 +279,27 @@ static void draw_bar(WINDOW *win, int row, int col,
                          wattroff(win, COLOR_PAIR(COLOR_TITLE) | A_BOLD);
                          wrefresh(win);
 
-                         while (1) {
+                         while (!quit) {
+                             /* ── reconnect loop ── */
+                             while (fd < 0 && !quit) {
+                                 render_reconnecting(win, attempt++);
+
+                                 /* wait 2 seconds, but keep checking for 'q' */
+                                 for (int i = 0; i < 200 && !quit; i++) {
+                                     int ch = getch();
+                                     if (ch == 'q' || ch == 'Q') { quit = 1; break; }
+                                     usleep(10000);   /* 10ms × 200 = 2s */
+                                 }
+                                 if (quit) break;
+
+                                 fd = connect_to_server(SERVER_IP, PORT);
+                                 if (fd >= 0) {
+                                     attempt = 1;
+                                     buf_len = 0;
+                                 }
+                             }
+                             if (quit) break;
+
                              /* ── keyboard input ── */
                              int ch = getch();
                              if (ch == 'q' || ch == 'Q') break;
@@ -271,15 +323,16 @@ static void draw_bar(WINDOW *win, int row, int col,
                                  memmove(buf, line_start, buf_len);
 
                              } else if (n == 0) {
-                                 /* server closed connection */
-                                 break;
+                                 /* server closed connection — trigger reconnect */
+                                 close(fd);
+                                 fd = -1;
                              }
 
                              /* ── ~60 fps loop ── */
                              usleep(16000);
                          }
 
-                         close(fd);
+                         if (fd >= 0) close(fd);
                          delwin(win);
                          endwin();
                          printf("NixMon exited.\n");
