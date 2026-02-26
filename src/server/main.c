@@ -34,6 +34,14 @@ void read_meminfo(SystemMetrics *m) {
         m->mem_pct = 100.0 * (m->mem_total_kb - m->mem_avail_kb) / m->mem_total_kb;
 }
 
+/* ── /proc/loadavg ────────────────────────────────────────────────────────── */
+void read_loadavg(SystemMetrics *m) {
+    FILE *fp = fopen("/proc/loadavg", "r");
+    if (!fp) { perror("open /proc/loadavg"); return; }
+    fscanf(fp, "%lf %lf %lf", &m->load_1m, &m->load_5m, &m->load_15m);
+    fclose(fp);
+}
+
 /* ── /proc/stat (CPU ticks) ───────────────────────────────────────────────── */
 typedef struct {
     long long user, nice, system, idle, iowait, irq, softirq;
@@ -103,6 +111,7 @@ void compute_cpu(SystemMetrics *m,
                      SystemMetrics m = {0};
                      compute_cpu(&m, t0, t1, core_count);
                      read_meminfo(&m);
+                     read_loadavg(&m);
                      m.uptime_sec = read_uptime();
 
                      /* ── print results ── */
@@ -114,6 +123,8 @@ void compute_cpu(SystemMetrics *m,
                      printf("RAM total      : %ld kB\n",  m.mem_total_kb);
                      printf("RAM available  : %ld kB\n",  m.mem_avail_kb);
                      printf("RAM used       : %.1f%%\n",  m.mem_pct);
+                     printf("Load avg       : %.2f  %.2f  %.2f  (1m 5m 15m)\n",
+                            m.load_1m, m.load_5m, m.load_15m);
                      printf("Uptime         : %ld sec\n", m.uptime_sec);
 
                      return 0;
