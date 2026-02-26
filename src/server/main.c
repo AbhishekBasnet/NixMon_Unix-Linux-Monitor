@@ -95,6 +95,42 @@ void compute_cpu(SystemMetrics *m,
     m->cpu_pct = (count > 0) ? total_pct / count : 0.0;
                  }
 
+                 /* ── JSON serializer ──────────────────────────────────────────────────────── */
+                 void serialize_metrics(const SystemMetrics *m, char *buf, size_t buf_size) {
+                     /* build cpu_cores array string first */
+                     char cores_str[512] = "[";
+                     for (int i = 0; i < m->core_count; i++) {
+                         char tmp[32];
+                         snprintf(tmp, sizeof(tmp), "%.1f%s", m->cpu_cores[i],
+                                  (i < m->core_count - 1) ? "," : "");
+                         strncat(cores_str, tmp, sizeof(cores_str) - strlen(cores_str) - 1);
+                     }
+                     strncat(cores_str, "]", sizeof(cores_str) - strlen(cores_str) - 1);
+
+                     snprintf(buf, buf_size,
+                              "{"
+                              "\"cpu_pct\":%.1f,"
+                              "\"cpu_cores\":%s,"
+                              "\"mem_total_kb\":%ld,"
+                              "\"mem_avail_kb\":%ld,"
+                              "\"mem_pct\":%.1f,"
+                              "\"load_1m\":%.2f,"
+                              "\"load_5m\":%.2f,"
+                              "\"load_15m\":%.2f,"
+                              "\"uptime_sec\":%ld"
+                              "}\n",
+                              m->cpu_pct,
+                              cores_str,
+                              m->mem_total_kb,
+                              m->mem_avail_kb,
+                              m->mem_pct,
+                              m->load_1m,
+                              m->load_5m,
+                              m->load_15m,
+                              m->uptime_sec
+                     );
+                 }
+
                  /* ── main ─────────────────────────────────────────────────────────────────── */
                  int main(void) {
                      printf("NixMon Server — /proc parser test\n");
@@ -126,6 +162,11 @@ void compute_cpu(SystemMetrics *m,
                      printf("Load avg       : %.2f  %.2f  %.2f  (1m 5m 15m)\n",
                             m.load_1m, m.load_5m, m.load_15m);
                      printf("Uptime         : %ld sec\n", m.uptime_sec);
+
+                     /* ── serialize to JSON ── */
+                     char json_buf[BUFFER_SIZE];
+                     serialize_metrics(&m, json_buf, sizeof(json_buf));
+                     printf("\nJSON frame:\n%s", json_buf);
 
                      return 0;
                  }
